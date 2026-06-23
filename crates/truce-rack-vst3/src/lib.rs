@@ -74,6 +74,27 @@ const CTRL_AFTERTOUCH: u8 = 128;
 const CTRL_PITCH_BEND: u8 = 129;
 const CTRL_PROGRAM_CHANGE: u8 = 130;
 
+/// Raw VST3 output event category captured from a plugin's
+/// `ProcessData::outputEvents` before truce-rack converts it into
+/// [`MidiData`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Vst3OutputEventKind {
+    NoteOn,
+    NoteOff,
+    PolyPressure,
+    LegacyMidiCcOut {
+        control_number: u8,
+        channel: u8,
+        value: u8,
+        value2: u8,
+    },
+    Data {
+        data_type: u32,
+        size: u32,
+    },
+    Other(u32),
+}
+
 /// VST3 scanner.
 #[derive(Debug, Default)]
 pub struct Vst3Scanner;
@@ -538,6 +559,7 @@ pub struct Vst3Plugin {
     /// `open()`, released on `close()` / Drop.
     view: Option<ComPtr<IPlugView>>,
     editor_open: bool,
+    last_output_event_kinds: Vec<Vst3OutputEventKind>,
 }
 
 impl Vst3Plugin {
@@ -659,7 +681,15 @@ impl Vst3Plugin {
             processing: false,
             view: None,
             editor_open: false,
+            last_output_event_kinds: Vec::new(),
         })
+    }
+
+    /// Raw VST3 output event categories captured during the most
+    /// recent successful `process()` call.
+    #[must_use]
+    pub fn last_output_event_kinds(&self) -> &[Vst3OutputEventKind] {
+        &self.last_output_event_kinds
     }
 }
 
@@ -1289,9 +1319,16 @@ impl Plugin<f32> for Vst3Plugin {
             ((*(*processor_ptr).vtbl).process)(processor_ptr, &raw mut data)
         });
         if status == kResultOk {
+            self.last_output_event_kinds = output_events_wrapper
+                .events
+                .borrow()
+                .iter()
+                .map(vst3_output_event_kind)
+                .collect();
             drain_vst3_output_events(&output_events_wrapper, context.output_events);
             Ok(ProcessStatus::Continue)
         } else {
+            self.last_output_event_kinds.clear();
             Ok(ProcessStatus::Error)
         }
     }
@@ -1463,6 +1500,31 @@ fn drain_vst3_output_events(events: &EventList3, output_events: &mut EventList) 
         if let Some(event) = rack_event_from_vst3(event) {
             output_events.push(event);
         }
+    }
+}
+
+fn vst3_output_event_kind(event: &Event) -> Vst3OutputEventKind {
+    match u32::from(event.r#type) {
+        t if t == EventTypes_::kNoteOnEvent => Vst3OutputEventKind::NoteOn,
+        t if t == EventTypes_::kNoteOffEvent => Vst3OutputEventKind::NoteOff,
+        t if t == EventTypes_::kPolyPressureEvent => Vst3OutputEventKind::PolyPressure,
+        t if t == EventTypes_::kLegacyMIDICCOutEvent => {
+            let cc = unsafe { event.__field0.midiCCOut };
+            Vst3OutputEventKind::LegacyMidiCcOut {
+                control_number: cc.controlNumber,
+                channel: midi_channel(i16::from(cc.channel)),
+                value: midi_data_byte(cc.value),
+                value2: midi_data_byte(cc.value2),
+            }
+        }
+        t if t == EventTypes_::kDataEvent => {
+            let data = unsafe { event.__field0.data };
+            Vst3OutputEventKind::Data {
+                data_type: data.r#type,
+                size: data.size,
+            }
+        }
+        other => Vst3OutputEventKind::Other(other),
     }
 }
 

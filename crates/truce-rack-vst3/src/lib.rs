@@ -37,13 +37,14 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use vst3::Steinberg::Vst::{
-    AudioBusBuffers, AudioBusBuffers__type0, BusDirections_, BusInfo, BusTypes_, Event,
-    Event_::EventTypes_, Event__type0, IAudioProcessor, IAudioProcessorTrait, IComponent,
-    IComponentTrait, IConnectionPoint, IConnectionPointTrait, IEditController,
-    IEditControllerTrait, IEventList, IEventListTrait, IParameterChanges, MediaTypes_,
-    NoteOffEvent, NoteOnEvent, ParameterInfo as Vst3ParameterInfo, ParameterInfo_::ParameterFlags_,
-    PolyPressureEvent, ProcessContext as Vst3ProcessContext, ProcessContext_::StatesAndFlags_,
-    ProcessData, ProcessModes_, ProcessSetup, SymbolicSampleSizes_, ViewType,
+    AudioBusBuffers, AudioBusBuffers__type0, BusDirections_, BusInfo, BusTypes_, DataEvent,
+    DataEvent_::DataTypes_, Event, Event_::EventTypes_, Event__type0, IAudioProcessor,
+    IAudioProcessorTrait, IComponent, IComponentTrait, IConnectionPoint, IConnectionPointTrait,
+    IEditController, IEditControllerTrait, IEventList, IEventListTrait, IParameterChanges,
+    LegacyMIDICCOutEvent, MediaTypes_, NoteOffEvent, NoteOnEvent,
+    ParameterInfo as Vst3ParameterInfo, ParameterInfo_::ParameterFlags_, PolyPressureEvent,
+    ProcessContext as Vst3ProcessContext, ProcessContext_::StatesAndFlags_, ProcessData,
+    ProcessModes_, ProcessSetup, SymbolicSampleSizes_, ViewType,
 };
 use vst3::Steinberg::{
     IBStream, IBStreamTrait, IPlugView, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
@@ -1214,6 +1215,7 @@ impl Plugin<f32> for Vst3Plugin {
         }
         let input_events_wrapper = ComWrapper::new(EventList3 {
             events: std::cell::RefCell::new(translated.events),
+            data_event_bytes: std::cell::RefCell::new(translated.data_event_bytes),
         });
         let input_events_ptr = input_events_wrapper
             .to_com_ptr::<IEventList>()
@@ -1303,6 +1305,7 @@ impl Plugin<f32> for Vst3Plugin {
 #[derive(Default)]
 struct EventBuffer {
     events: Vec<Event>,
+    data_event_bytes: Vec<Box<[u8]>>,
 }
 
 impl EventBuffer {
@@ -1381,13 +1384,77 @@ impl EventBuffer {
                 };
                 self.events.push(ev);
             }
-            // VST3 routes CC / ProgramChange / ChannelAftertouch /
-            // PitchBend / Sysex through IParameterChanges or
-            // IMidiMapping rather than IEventList. Wiring those is
-            // a follow-on; for hosting test purposes notes are the
-            // primary need.
+            MidiData::ControlChange {
+                channel,
+                controller,
+                value,
+            } => {
+                self.push_legacy_midi_cc(offset, controller, channel, value, 0);
+            }
+            MidiData::ProgramChange { channel, program } => {
+                self.push_legacy_midi_cc(offset, CTRL_PROGRAM_CHANGE, channel, program, 0);
+            }
+            MidiData::ChannelAftertouch { channel, pressure } => {
+                self.push_legacy_midi_cc(offset, CTRL_AFTERTOUCH, channel, pressure, 0);
+            }
+            MidiData::PitchBend { channel, value } => {
+                let lsb = u8::try_from(value & 0x7F).unwrap_or(0);
+                let msb = u8::try_from((value >> 7) & 0x7F).unwrap_or(0);
+                self.push_legacy_midi_cc(offset, CTRL_PITCH_BEND, channel, lsb, msb);
+            }
+            MidiData::Raw { len, data } if len > 0 => {
+                self.push_data_event(offset, len, data);
+            }
             _ => {}
         }
+    }
+
+    fn push_legacy_midi_cc(
+        &mut self,
+        offset: i32,
+        control: u8,
+        channel: u8,
+        value: u8,
+        value2: u8,
+    ) {
+        let ev = Event {
+            busIndex: 0,
+            sampleOffset: offset,
+            ppqPosition: 0.0,
+            flags: 0,
+            r#type: u16::try_from(EventTypes_::kLegacyMIDICCOutEvent).unwrap_or(u16::MAX),
+            __field0: Event__type0 {
+                midiCCOut: LegacyMIDICCOutEvent {
+                    controlNumber: control,
+                    channel: i8::try_from(channel & 0x0F).unwrap_or(0),
+                    value: i8::try_from(value & 0x7F).unwrap_or(0),
+                    value2: i8::try_from(value2 & 0x7F).unwrap_or(0),
+                },
+            },
+        };
+        self.events.push(ev);
+    }
+
+    fn push_data_event(&mut self, offset: i32, len: u8, data: [u8; 8]) {
+        let len = len.min(8);
+        let bytes = data[..usize::from(len)].to_vec().into_boxed_slice();
+        let ptr = bytes.as_ptr();
+        self.data_event_bytes.push(bytes);
+        let ev = Event {
+            busIndex: 0,
+            sampleOffset: offset,
+            ppqPosition: 0.0,
+            flags: 0,
+            r#type: u16::try_from(EventTypes_::kDataEvent).unwrap_or(0),
+            __field0: Event__type0 {
+                data: DataEvent {
+                    size: u32::from(len),
+                    r#type: DataTypes_::kMidiSysEx,
+                    bytes: ptr,
+                },
+            },
+        };
+        self.events.push(ev);
     }
 }
 
@@ -1430,6 +1497,10 @@ fn rack_event_from_vst3(event: &Event) -> Option<RackEvent> {
             let cc = unsafe { event.__field0.midiCCOut };
             legacy_midi_cc_to_rack(cc.controlNumber, cc.channel, cc.value, cc.value2)?
         }
+        t if t == EventTypes_::kDataEvent => {
+            let data = unsafe { event.__field0.data };
+            data_event_to_rack(data)?
+        }
         _ => return None,
     };
 
@@ -1437,6 +1508,25 @@ fn rack_event_from_vst3(event: &Event) -> Option<RackEvent> {
         sample_offset,
         body,
     })
+}
+
+fn data_event_to_rack(event: DataEvent) -> Option<EventBody> {
+    if event.r#type != u32::try_from(DataTypes_::kMidiSysEx).ok()? || event.bytes.is_null() {
+        return None;
+    }
+
+    let len = usize::try_from(event.size).ok()?.min(8);
+    if len == 0 {
+        return None;
+    }
+
+    let mut data = [0; 8];
+    let bytes = unsafe { std::slice::from_raw_parts(event.bytes, len) };
+    data[..len].copy_from_slice(bytes);
+    Some(EventBody::Midi(MidiData::Raw {
+        len: u8::try_from(len).unwrap_or(8),
+        data,
+    }))
 }
 
 fn legacy_midi_cc_to_rack(control: u8, channel: i8, value: i8, value2: i8) -> Option<EventBody> {
@@ -1489,6 +1579,7 @@ fn normalized_to_midi(value: f32) -> u8 {
 #[derive(Default)]
 struct EventList3 {
     events: std::cell::RefCell<Vec<Event>>,
+    data_event_bytes: std::cell::RefCell<Vec<Box<[u8]>>>,
 }
 
 impl Class for EventList3 {
@@ -1517,7 +1608,22 @@ impl IEventListTrait for EventList3 {
         if event.is_null() {
             return -1;
         }
-        self.events.borrow_mut().push(unsafe { *event });
+        let mut event = unsafe { *event };
+        if u32::from(event.r#type) == EventTypes_::kDataEvent {
+            let data = unsafe { event.__field0.data };
+            if !data.bytes.is_null() && data.size > 0 {
+                let len = usize::try_from(data.size).unwrap_or(usize::MAX);
+                let bytes = unsafe { std::slice::from_raw_parts(data.bytes, len) }
+                    .to_vec()
+                    .into_boxed_slice();
+                let ptr = bytes.as_ptr();
+                self.data_event_bytes.borrow_mut().push(bytes);
+                event.__field0 = Event__type0 {
+                    data: DataEvent { bytes: ptr, ..data },
+                };
+            }
+        }
+        self.events.borrow_mut().push(event);
         kResultOk
     }
 }
